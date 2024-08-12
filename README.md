@@ -70,7 +70,6 @@ Example:
   $ python3 firewall_object_resolver.py -d -e -1 src -2 dst -3 svc policies.csv addresses.csv addgrps.csv services.csv svcgrps.csv
 ```
 
-
 ### License
 
 This project is licensed under the [Apache-2.0 license](LICENSE).
