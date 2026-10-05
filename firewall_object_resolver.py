@@ -5,6 +5,10 @@ import sys
 import csv
 import argparse
 import logging
+import ipaddress
+
+
+IP_VERSIONS = {4: (32, '0.0.0.0/0'), 6: (128, '::/0')}
 
 
 def resolve_groups(obj, dictionary):
@@ -16,6 +20,38 @@ def resolve_groups(obj, dictionary):
     for sub_obj in dictionary[obj]:
         output += resolve_groups(sub_obj, dictionary)
     return output
+
+
+def subtract_networks(positives, negatives, version):
+    """Subtracts a list of ipaddr nets from another list of ipaddr nets"""
+    if not negatives:
+        return positives
+    # Default to /0 if positives list is empty
+    if not positives:
+        current_nets = {ipaddress.ip_network(IP_VERSIONS[version][1])}
+    else:
+        current_nets = positives
+        
+    neg_nets = negatives
+    
+    # Subtract each negative network from the current positive space
+    for neg in neg_nets:
+        next_nets = set()
+        for pos in current_nets:
+            if pos.overlaps(neg):
+                try:
+                    # Exclude the negative network from the positive network
+                    excluded = list(pos.address_exclude(neg))
+                    next_nets.update(excluded)
+                except ValueError:
+                    # If neg is not a strict subnet of pos, keep pos as is
+                    next_nets.add(pos)
+            else:
+                next_nets.add(pos)
+        current_nets = next_nets
+        
+    # Return sorted list of resulting networks as strings
+    return [str(net) for net in sorted(current_nets)]
 
 
 if __name__ == '__main__':
@@ -45,6 +81,16 @@ if __name__ == '__main__':
                                                                                           'a value in policy is not '
                                                                                           'found in the respective csv '
                                                                                           'lookup. Default: False')
+    parser.add_argument('-i', '--invert-object', action='store_true', default=False, help='If the object or group name '
+                                                                                          'in policies is preceded by'
+                                                                                          '    an exlamation point "!",'
+                                                                                          ' treat it as negative match,'
+                                                                                          ' subtracting it from the '
+                                                                                          'other results. Negations have'
+                                                                                          ' priority over matches. When '
+                                                                                          'using this mode, the original'
+                                                                                          ' number of field members can '
+                                                                                          'be lost. Default: False')
     parser.add_argument('-d', '--deduplicate', action='store_true', default=False, help='Deduplicate results. Default: '
                                                                                         'False')
     parser.add_argument('-1', '--source-column', type=str, default='source', help='The column header in the csv '
@@ -131,12 +177,22 @@ if __name__ == '__main__':
     for idx, line in enumerate(parsed_policies[1:], start=1):
         output_line = line
         results = []
+        negative_results = []
         try:
             for member in line[SRC_INDEX].split(args.address_separator):
+                invert = False
                 logging.debug('Checking source address %s in policy at line %d', member, idx)
+                if args.invert_object:
+                    if member.startswith('!'):
+                        invert = True
+                        member = member[1:]
+                        logging.warning('Found inverted object or group: %s, inverting due to -i flag', member)
                 groups_done = resolve_groups(member, address_group_dict)
                 for addr_obj in groups_done:
-                    results += address_dict[addr_obj]
+                    if invert:
+                        negative_results += address_dict[addr_obj]
+                    else:
+                        results += address_dict[addr_obj]
         except KeyError:
             if not args.allow_unknown:
                 logging.critical('ERROR: source address %s in policy at line %d not found in lookups. Run with -e flag '
@@ -144,30 +200,122 @@ if __name__ == '__main__':
                 sys.exit(1)
             logging.error('ERROR: source address %s in policy at line %d not found in lookups. Continuing anyway '
                           'due to -e flag', member, idx)
-        if args.deduplicate:
+        if negative_results and args.invert_object:
+            logging.info('Converting strings to addresses and subtracting negations from positives')
+            logging.debug('Positive objects: %s', results)
+            logging.debug('Negative objects: %s', negative_results)
+            positives = {ver: [] for ver in IP_VERSIONS}
+            negatives = {ver: [] for ver in IP_VERSIONS}
+            for objec in results:
+                range_check = objec.split('-')
+                if len(range_check) == 2:
+                    logging.debug('Detected IP range %s, converting to tuple', range_check)
+                    range_start = ipaddress.ip_address(range_check[0])
+                    range_end = ipaddress.ip_address(range_check[1])
+                    range_networks = list(ipaddress.summarize_address_range(range_start, range_end))
+                    positives[objec_obj.version] += range_networks
+                else:
+                    logging.debug('Converting string %s to network object', objec)
+                    objec_obj = ipaddress.ip_network(objec, strict=False)
+                    positives[objec_obj[0].version].append(objec_obj)
+            for objec in negative_results:
+                range_check = objec.split('-')
+                if len(range_check) == 2:
+                    logging.debug('Detected IP range %s, converting to tuple', range_check)
+                    range_start = ipaddress.ip_address(range_check[0])
+                    range_end = ipaddress.ip_address(range_check[1])
+                    range_networks = list(ipaddress.summarize_address_range(range_start, range_end))
+                    negatives[objec_obj.version] += range_networks
+                else:
+                    logging.debug('Converting string %s to network object', objec)
+                    objec_obj = ipaddress.ip_network(objec, strict=False)
+                    negatives[objec_obj[0].version].append(objec_obj)
+            # Deduplicate
+            positives = {ver: list(set(l)) for ver, l in positives.items()}
+            negatives = {ver: list(set(l)) for ver, l in negatives.items()}
+            # Aggregate as much as possible
+            positives = {ver: list(ipaddress.collapse_addresses(l)) for ver, l in positives.items()}
+            negatives = {ver: list(ipaddress.collapse_addresses(l)) for ver, l in negatives.items()}
+            
+            results = []
+            for ver , pos in positives.items():
+                results += subtract_networks(pos, negatives[ver], ver)
+            logging.debug('Result of negation: %s', results)
+        elif args.deduplicate:
             logging.info('Deduplicating sources')
             results = list(set(results))
         output_line[SRC_INDEX] = args.address_separator.join(results)
         results = []
+        negative_results = []
         try:
             for member in line[DEST_INDEX].split(args.address_separator):
+                invert = False
                 logging.debug('Checking destination address %s in policy at line %d', member, idx)
+                if args.invert_object:
+                    if member.startswith('!'):
+                        invert = True
+                        member = member[1:]
+                        logging.warning('Found inverted object or group: %s, inverting due to -i flag', member)
                 groups_done = resolve_groups(member, address_group_dict)
                 for addr_obj in groups_done:
-                    results += address_dict[addr_obj]
+                    if invert:
+                        negative_results += address_dict[addr_obj]
+                    else:
+                        results += address_dict[addr_obj]
         except KeyError:
             if not args.allow_unknown:
-                logging.critical('ERROR: destination address %s in policy at line %d not found in lookups. Run with -e '
-                                 'flag to continue anyway. Exiting...', member, idx)
+                logging.critical('ERROR: destination address %s in policy at line %d not found in lookups. Run with -e flag '
+                                 'to continue anyway. Exiting...', member, idx)
                 sys.exit(1)
-            logging.error(
-                'ERROR: destination address %s in policy at line %d not found in lookups. Continuing anyway due to -e '
-                'flag', member, idx)
-        if args.deduplicate:
+            logging.error('ERROR: destination address %s in policy at line %d not found in lookups. Continuing anyway '
+                          'due to -e flag', member, idx)
+        if negative_results and args.invert_object:
+            logging.info('Converting strings to addresses and subtracting negations from positives')
+            logging.debug('Positive objects: %s', results)
+            logging.debug('Negative objects: %s', negative_results)
+            positives = {ver: [] for ver in IP_VERSIONS}
+            negatives = {ver: [] for ver in IP_VERSIONS}
+            for objec in results:
+                range_check = objec.split('-')
+                if len(range_check) == 2:
+                    logging.debug('Detected IP range %s, converting to tuple', range_check)
+                    range_start = ipaddress.ip_address(range_check[0])
+                    range_end = ipaddress.ip_address(range_check[1])
+                    range_networks = list(ipaddress.summarize_address_range(range_start, range_end))
+                    positives[objec_obj.version] += range_networks
+                else:
+                    logging.debug('Converting string %s to network object', objec)
+                    objec_obj = ipaddress.ip_network(objec, strict=False)
+                    positives[objec_obj[0].version].append(objec_obj)
+            for objec in negative_results:
+                range_check = objec.split('-')
+                if len(range_check) == 2:
+                    logging.debug('Detected IP range %s, converting to tuple', range_check)
+                    range_start = ipaddress.ip_address(range_check[0])
+                    range_end = ipaddress.ip_address(range_check[1])
+                    range_networks = list(ipaddress.summarize_address_range(range_start, range_end))
+                    negatives[objec_obj.version] += range_networks
+                else:
+                    logging.debug('Converting string %s to network object', objec)
+                    objec_obj = ipaddress.ip_network(objec, strict=False)
+                    negatives[objec_obj[0].version].append(objec_obj)
+            # Deduplicate
+            positives = {ver: list(set(l)) for ver, l in positives.items()}
+            negatives = {ver: list(set(l)) for ver, l in negatives.items()}
+            # Aggregate as much as possible
+            positives = {ver: list(ipaddress.collapse_addresses(l)) for ver, l in positives.items()}
+            negatives = {ver: list(ipaddress.collapse_addresses(l)) for ver, l in negatives.items()}
+            
+            results = []
+            for ver , pos in positives.items():
+                results += subtract_networks(pos, negatives[ver], ver)
+            logging.debug('Result of negation: %s', results)
+        elif args.deduplicate:
             logging.info('Deduplicating destinations')
             results = list(set(results))
         output_line[DEST_INDEX] = args.address_separator.join(results)
         results = []
+        
         results_port = []
         try:
             for member in line[SVC_INDEX].split(args.address_separator):
