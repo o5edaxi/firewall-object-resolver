@@ -31,12 +31,21 @@ DNS,6;17,53
 for services.
 
 
+### Negative objects
+
+If the object or group name in policies is preceded by an exlamation point "!", treat it as negative match, subtracting it from the other results. Negations have priority over matches. When using this mode, the original number of field members can be lost. Default: False
+
+
 ### Usage
 
 ```
-usage: firewall_object_resolver.py [-h] [-o OUTPUT_FILE] [-e] [-d] [-1 SOURCE_COLUMN] [-2 DESTINATION_COLUMN] [-3 SERVICE_COLUMN] [-c CSV_SEPARATOR]
-                                   [-r ADDRESS_SEPARATOR] [-x {DEBUG,INFO,WARNING,ERROR,CRITICAL}]
+usage: firewall_object_resolver.py [-h] [-o OUTPUT_FILE] [-e] [-i] [-d] [-1 SOURCE_COLUMN] [-2 DESTINATION_COLUMN] [-3 SERVICE_COLUMN] [-c CSV_SEPARATOR] [-r ADDRESS_SEPARATOR] [-x {DEBUG,INFO,WARNING,ERROR,CRITICAL}]
                                    input_policies input_addresses input_address_groups input_services input_service_groups
+
+Takes a list of policies as csv as well as csv files for address, address group, service, and service group definitions, and outputs a list of policies containing raw IPs, protocols, and port numbers. Theadditional
+csv files for address objects, service objects, and theirgroups are simple lookup tables in which the first column is the name of the object or group, and the second column is the value of the IP or group members
+separated by the --address-separator. For services, the first column is the name of the service, the second is the protocol, and the third is the port. A service can contain multiple protocols and ports separated by
+the --address-separator. Example:service,protocol,portRADIUS,6;17,1812;1813
 
 positional arguments:
   input_policies        Input csv containing the firewall policies
@@ -50,6 +59,8 @@ options:
   -o OUTPUT_FILE, --output-file OUTPUT_FILE
                         The name of the output file containing the policy list. Default: output.csv
   -e, --allow-unknown   Do not exit the script when a value in policy is not found in the respective csv lookup. Default: False
+  -i, --invert-object   If the object or group name in policies is preceded by an exlamation point "!", treat it as negative match, subtracting it from the other results. Negations have priority over matches. When
+                        using this mode, the original number of field members can be lost. Default: False
   -d, --deduplicate     Deduplicate results. Default: False
   -1 SOURCE_COLUMN, --source-column SOURCE_COLUMN
                         The column header in the csv corresponding to the source address column. Default: source
